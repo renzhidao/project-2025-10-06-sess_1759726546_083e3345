@@ -1,135 +1,83 @@
-from typing import Callable, List, Optional, Sequence, TYPE_CHECKING, Union
+from typing import List, Optional
 
-if TYPE_CHECKING:
-    from core.repository import ClipRepository
-
-TextProvider = Callable[[], Optional[Union[str, bytes]]]
+from core.history import History, ClipEntry
+from core.repository import ClipRepository
 
 
-def _as_str(value: Optional[Union[str, bytes]]) -> Optional[str]:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value
-    if isinstance(value, (bytes, bytearray)):
-        try:
-            return bytes(value).decode("utf-8", errors="ignore")
-        except Exception:
-            return None
-    return None
-
-
-def _provider_android() -> Optional[str]:
+class HistoryStorageSync:
     """
-    Try to read clipboard via Android ClipboardManager using pyjnius.
-    Returns None if environment or access is not available.
+    Utilities to synchronize in-memory History with persistent storage via ClipRepository.
+    - load_from_storage: populate History from repository list, preserving order and pinned flags.
+    - flush_to_storage: persist History items into repository, preserving pinned flags and relative recency.
     """
-    try:
-        from jnius import autoclass  # type: ignore
-    except Exception:
-        return None
 
-    try:
-        PythonActivity = autoclass("org.kivy.android.PythonActivity")
-        Context = autoclass("android.content.Context")
-        activity = PythonActivity.mActivity
-        clipboard = activity.getSystemService(Context.CLIPBOARD_SERVICE)
-        if clipboard is None:
-            return None
-        if not clipboard.hasPrimaryClip():
-            return None
-        clip = clipboard.getPrimaryClip()
-        if clip is None or clip.getItemCount() <= 0:
-            return None
-        item = clip.getItemAt(0)
-        txt = item.getText()
-        if txt is not None:
-            s = _as_str(str(txt))
-            return s if s else None
-        coerced = item.coerceToText(activity)
-        if coerced is not None:
-            s = _as_str(str(coerced))
-            return s if s else None
-    except Exception:
-        return None
-    return None
+    def __init__(self, history: History, repo: ClipRepository) -> None:
+        self.history = history
+        self.repo = repo
 
+    def _clear_history(self) -> None:
+        # Clear safely using public API
+        for e in list(self.history.list()):
+            self.history.remove(e.id)
 
-def _provider_kivy() -> Optional[str]:
-    """
-    Try to read clipboard via Kivy Clipboard.
-    Returns None if not available or clipboard empty.
-    """
-    try:
-        from kivy.core.clipboard import Clipboard  # type: ignore
-    except Exception:
-        return None
+    def load_from_storage(self, clear_history: bool = False) -> int:
+        """
+        Load items from repository into history.
+        - If clear_history is True, empties current history first.
+        - Order preservation: within pinned/unpinned groups, newer items should surface first.
+          We insert items oldest->newest, so History's timestamps reflect the expected order.
+        Returns number of items loaded.
+        """
+        if clear_history:
+            self._clear_history()
 
-    try:
-        value = Clipboard.paste()
-        s = _as_str(value)
-        return s if s else None
-    except Exception:
-        return None
+        rows = self.repo.list_all()
+        pinned_rows = [r for r in rows if r["pinned"]]
+        unpinned_rows = [r for r in rows if not r["pinned"]]
 
+        # Insert oldest -> newest to ensure recency ordering in History
+        def sort_key(r):
+            return (int(r["created_at"]), int(r["id"]))
 
-def _provider_pyperclip() -> Optional[str]:
-    """
-    Try to read clipboard via pyperclip.
-    Returns None if not available or clipboard empty.
-    """
-    try:
-        import pyperclip  # type: ignore
-    except Exception:
-        return None
+        for r in sorted(pinned_rows, key=sort_key):
+            e = self.history.add(r["text"])
+            self.history.pin(e.id, True)
 
-    try:
-        value = pyperclip.paste()
-        s = _as_str(value)
-        return s if s else None
-    except Exception:
-        return None
+        for r in sorted(unpinned_rows, key=sort_key):
+            self.history.add(r["text"])
 
+        return len(rows)
 
-def default_providers() -> List[TextProvider]:
-    return [_provider_android, _provider_kivy, _provider_pyperclip]
+    def flush_to_storage(
+        self,
+        include_pinned: bool = True,
+        include_unpinned: bool = True,
+    ) -> int:
+        """
+        Persist History items into repository.
+        - Adds or touches existing rows (NOCASE) via repo.add_text.
+        - Ensures pinned flags in storage match History.
+        - Inserts in ascending created_at order to preserve relative recency using repo clock.
+        Returns number of history items processed (added/touched).
+        """
+        entries: List[ClipEntry] = self.history.list()
 
+        filtered: List[ClipEntry] = []
+        for e in entries:
+            if e.pinned and include_pinned:
+                filtered.append(e)
+            elif (not e.pinned) and include_unpinned:
+                filtered.append(e)
 
-def get_clipboard_text_from_providers(providers: Sequence[TextProvider]) -> Optional[str]:
-    """
-    Iterate providers and return the first non-empty string.
-    Silently ignores provider exceptions.
-    """
-    for prov in providers:
-        try:
-            value = prov()
-        except Exception:
-            continue
-        s = _as_str(value)
-        if s is not None and s != "":
-            return s
-    return None
+        # Oldest -> newest so repository timestamps reflect natural order
+        filtered.sort(key=lambda e: (int(e.created_at), int(e.id)))
 
+        processed = 0
+        for e in filtered:
+            row = self.repo.add_text(e.text, pinned=True if e.pinned else None)
+            if e.pinned and not bool(row["pinned"]):
+                # Ensure pinned state is propagated for existing duplicates
+                self.repo.pin(int(row["id"]), True)
+            processed += 1
 
-def get_clipboard_text() -> Optional[str]:
-    """
-    Read clipboard text using platform-specific providers.
-    Returns None if not available.
-    """
-    return get_clipboard_text_from_providers(default_providers())
-
-
-def ingest_clipboard_once(repo: "ClipRepository", reader: Optional[Callable[[], Optional[str]]] = None):
-    """
-    Read clipboard once and insert/touch repository.
-    - Skips None or empty string.
-    - Returns row dict if added/touched, else None.
-    """
-    read = reader or get_clipboard_text
-    try:
-        text = read()
-    except Exception:
-        return None
-    if not isinstance(text, str) or text == "":
-        return None
-    return repo.add_text(text)
+        return processed
