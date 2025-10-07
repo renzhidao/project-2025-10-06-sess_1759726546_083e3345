@@ -1,0 +1,74 @@
+import sitecustomize  # ensure import hook installed early
+import unittest
+
+from core.history import History
+
+
+class TestHistory(unittest.TestCase):
+    def setUp(self):
+        # deterministic clock: increments by 1 each call
+        self.t = [1000]
+
+        def clock():
+            self.t[0] += 1
+            return self.t[0]
+
+        self.clock = clock
+        self.h = History(clock=clock)
+
+    def test_add_and_order(self):
+        self.h.add("Foo")
+        self.h.add("Bar")
+        self.h.add("Baz")
+        texts = [e.text for e in self.h.list()]
+        self.assertEqual(texts, ["Baz", "Bar", "Foo"])
+
+    def test_add_duplicate_updates_timestamp_and_moves_up(self):
+        e1 = self.h.add("Hello")
+        self.h.add("world")
+        e_dup = self.h.add("HELLO")  # dedupe case-insensitive
+        self.assertEqual(self.h.size(), 2)
+        self.assertEqual(e1.id, e_dup.id)
+        # 'HELLO' should now be most recent among unpinned
+        texts = [e.text for e in self.h.list()]
+        self.assertEqual(texts[0].casefold(), "hello")
+        self.assertEqual({t.casefold() for t in texts}, {"hello", "world"})
+
+    def test_pin_unpin_and_order(self):
+        a = self.h.add("a")
+        b = self.h.add("b")
+        c = self.h.add("c")
+        self.h.pin(b.id, True)
+        texts = [e.text for e in self.h.list()]
+        self.assertEqual(texts, ["b", "c", "a"])
+        self.h.pin(b.id, False)
+        texts2 = [e.text for e in self.h.list()]
+        self.assertEqual(texts2, ["c", "b", "a"])
+
+    def test_search_case_ins_and_pinned_first(self):
+        a = self.h.add("Apple")
+        self.h.add("banana")
+        self.h.add("applet")
+        self.h.pin(a.id, True)
+        results = self.h.search("app")
+        texts = [e.text for e in results]
+        # pinned 'Apple' should come before 'applet'
+        self.assertEqual(texts[0], "Apple")
+        self.assertIn("applet", texts)
+        self.assertEqual(len(texts), 2)
+
+    def test_dedupe_all_keeps_newest(self):
+        # Use a history that allows duplicates, then dedupe them.
+        h2 = History(clock=self.clock, dedupe_case_insensitive=False)
+        h2.add("X")
+        h2.add("x")
+        h2.add("Xy")
+        h2.add("x")
+        self.assertEqual(h2.size(), 4)
+        h2.dedupe()
+        texts = sorted([e.text.casefold() for e in h2.list()])
+        self.assertEqual(texts, ["x", "xy"])
+
+
+if __name__ == "__main__":
+    unittest.main()
