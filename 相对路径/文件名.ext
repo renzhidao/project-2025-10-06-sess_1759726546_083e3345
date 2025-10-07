@@ -1,45 +1,82 @@
-from typing import Optional
-from core.storage import ClipboardStorage
+import threading
+from typing import Callable, Optional
+
+from core.repository import ClipRepository
 
 
-def enforce_max_items(
-    storage: ClipboardStorage,
-    max_items: Optional[int],
-    include_pinned_in_limit: bool = False,
-) -> int:
+class ClipboardMonitor:
     """
-    Enforce a maximum number of items in storage.
-    - If max_items is None or <= 0, no action is taken.
-    - Pinned items are never deleted.
-    - If include_pinned_in_limit is False (default): keep up to max_items unpinned items
-      in addition to all pinned items.
-    - If include_pinned_in_limit is True: keep up to max_items total items by limiting
-      the number of unpinned items to (max_items - pinned_count), but still never delete pinned.
-      If pinned_count > max_items, no unpinned items are kept.
-    Returns number of rows deleted.
+    Polls the clipboard via a reader() function at a fixed interval and ingests
+    new values into the repository. Avoids re-processing the same consecutive value
+    by comparing a normalized key (case-insensitive by default).
     """
-    if max_items is None:
-        return 0
-    try:
-        limit = int(max_items)
-    except Exception:
-        return 0
-    if limit <= 0:
-        return 0
 
-    rows = storage.list_all()
-    pinned = [r for r in rows if r["pinned"]]
-    unpinned = [r for r in rows if not r["pinned"]]
+    def __init__(
+        self,
+        repo: ClipRepository,
+        reader: Callable[[], Optional[str]],
+        interval: float = 1.0,
+        case_insensitive: bool = True,
+    ) -> None:
+        if interval <= 0:
+            interval = 0.1
+        self.repo = repo
+        self.reader = reader
+        self.interval = float(interval)
+        self.case_insensitive = bool(case_insensitive)
+        self._last_seen_key: Optional[str] = None
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
 
-    if include_pinned_in_limit:
-        keep_unpinned = max(0, limit - len(pinned))
-    else:
-        keep_unpinned = limit
+    def _key(self, text: str) -> str:
+        return text.casefold() if self.case_insensitive else text
 
-    # unpinned are already ordered by created_at desc, id desc via list_all()
-    to_delete = unpinned[keep_unpinned:]
-    deleted = 0
-    for r in to_delete:
-        if storage.delete(int(r["id"])):
-            deleted += 1
-    return deleted
+    def run_step(self) -> Optional[dict]:
+        """
+        Perform a single poll step. Returns the added/touched row dict if new content is processed,
+        otherwise None.
+        """
+        try:
+            text = self.reader()
+        except Exception:
+            return None
+        if not isinstance(text, str) or text == "":
+            return None
+        k = self._key(text)
+        if self._last_seen_key is not None and k == self._last_seen_key:
+            return None
+        row = self.repo.add_text(text)
+        self._last_seen_key = k
+        return row
+
+    def _loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self.run_step()
+            except Exception:
+                # Never break loop on step errors
+                pass
+            # Use wait for better responsiveness to stop
+            self._stop_event.wait(self.interval)
+
+    def start(self) -> bool:
+        if self._thread and self._thread.is_alive():
+            return False
+        self._stop_event.clear()
+        t = threading.Thread(target=self._loop, name="ClipboardMonitor", daemon=True)
+        self._thread = t
+        t.start()
+        return True
+
+    def stop(self, timeout: Optional[float] = 1.0) -> None:
+        self._stop_event.set()
+        t = self._thread
+        if t and t.is_alive():
+            try:
+                t.join(timeout=timeout)
+            except Exception:
+                pass
+
+    def is_running(self) -> bool:
+        t = self._thread
+        return bool(t and t.is_alive())
