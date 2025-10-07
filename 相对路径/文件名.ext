@@ -1,121 +1,45 @@
-import json
-import os
-from dataclasses import asdict, dataclass
-from typing import Any, Dict, Optional
+from typing import Optional
+from core.storage import ClipboardStorage
 
 
-@dataclass(eq=True)
-class AppConfig:
-    storage_path: str = ":memory:"
-    dedupe_case_insensitive: bool = True
-    max_items: Optional[int] = None  # None = unlimited
-    read_on_foreground: bool = True
-    background_monitor: bool = False
-    notify_on_copy: bool = False
-    start_on_boot: bool = False
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
-def _to_bool(v: Any, default: bool = False) -> bool:
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return bool(v)
-    if isinstance(v, str):
-        s = v.strip().lower()
-        if s in ("1", "true", "yes", "on"):
-            return True
-        if s in ("0", "false", "no", "off"):
-            return False
-    return default
-
-
-def _to_int_or_none(v: Any) -> Optional[int]:
-    if v is None:
-        return None
+def enforce_max_items(
+    storage: ClipboardStorage,
+    max_items: Optional[int],
+    include_pinned_in_limit: bool = False,
+) -> int:
+    """
+    Enforce a maximum number of items in storage.
+    - If max_items is None or <= 0, no action is taken.
+    - Pinned items are never deleted.
+    - If include_pinned_in_limit is False (default): keep up to max_items unpinned items
+      in addition to all pinned items.
+    - If include_pinned_in_limit is True: keep up to max_items total items by limiting
+      the number of unpinned items to (max_items - pinned_count), but still never delete pinned.
+      If pinned_count > max_items, no unpinned items are kept.
+    Returns number of rows deleted.
+    """
+    if max_items is None:
+        return 0
     try:
-        iv = int(v)
-        return iv if iv > 0 else None
+        limit = int(max_items)
     except Exception:
-        return None
+        return 0
+    if limit <= 0:
+        return 0
 
+    rows = storage.list_all()
+    pinned = [r for r in rows if r["pinned"]]
+    unpinned = [r for r in rows if not r["pinned"]]
 
-def _coerce_config(data: Dict[str, Any], base: Optional[AppConfig] = None) -> AppConfig:
-    base = base or AppConfig()
-    storage_path = data.get("storage_path", base.storage_path)
-    if not isinstance(storage_path, str) or storage_path == "":
-        storage_path = base.storage_path
+    if include_pinned_in_limit:
+        keep_unpinned = max(0, limit - len(pinned))
+    else:
+        keep_unpinned = limit
 
-    dedupe_case_insensitive = _to_bool(data.get("dedupe_case_insensitive", base.dedupe_case_insensitive),
-                                       base.dedupe_case_insensitive)
-    max_items = _to_int_or_none(data.get("max_items", base.max_items))
-    read_on_foreground = _to_bool(data.get("read_on_foreground", base.read_on_foreground), base.read_on_foreground)
-    background_monitor = _to_bool(data.get("background_monitor", base.background_monitor), base.background_monitor)
-    notify_on_copy = _to_bool(data.get("notify_on_copy", base.notify_on_copy), base.notify_on_copy)
-    start_on_boot = _to_bool(data.get("start_on_boot", base.start_on_boot), base.start_on_boot)
-
-    return AppConfig(
-        storage_path=storage_path,
-        dedupe_case_insensitive=dedupe_case_insensitive,
-        max_items=max_items,
-        read_on_foreground=read_on_foreground,
-        background_monitor=background_monitor,
-        notify_on_copy=notify_on_copy,
-        start_on_boot=start_on_boot,
-    )
-
-
-def load_config(path: str, default: Optional[AppConfig] = None) -> AppConfig:
-    """
-    Load AppConfig from JSON file. If path does not exist, returns default or AppConfig().
-    Raises ValueError if JSON exists but invalid.
-    Unknown fields are ignored; values are coerced to correct types.
-    """
-    if not isinstance(path, str) or path == "":
-        raise ValueError("path must be a non-empty string")
-
-    if not os.path.exists(path):
-        return default or AppConfig()
-
-    with open(path, "r", encoding="utf-8") as f:
-        try:
-            data = json.load(f)
-        except Exception as e:
-            raise ValueError("invalid JSON") from e
-
-    if not isinstance(data, dict):
-        raise ValueError("config JSON must be an object")
-
-    return _coerce_config(data, base=default or AppConfig())
-
-
-def save_config(path: str, cfg: AppConfig) -> None:
-    """
-    Save AppConfig to JSON file (UTF-8). Creates parent directories if needed.
-    """
-    if not isinstance(path, str) or path == "":
-        raise ValueError("path must be a non-empty string")
-    directory = os.path.dirname(path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    data = cfg.to_dict()
-    content = json.dumps(data, indent=2, ensure_ascii=False)
-    # Best-effort write
-    tmp_path = f"{path}.tmp"
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(content)
-        try:
-            os.replace(tmp_path, path)
-        except Exception:
-            # Fallback to direct write
-            with open(path, "w", encoding="utf-8") as f2:
-                f2.write(content)
-    finally:
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
+    # unpinned are already ordered by created_at desc, id desc via list_all()
+    to_delete = unpinned[keep_unpinned:]
+    deleted = 0
+    for r in to_delete:
+        if storage.delete(int(r["id"])):
+            deleted += 1
+    return deleted
