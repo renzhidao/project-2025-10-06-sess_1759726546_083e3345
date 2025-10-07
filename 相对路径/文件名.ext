@@ -1,82 +1,105 @@
-import threading
-from typing import Callable, Optional
+from typing import Callable, List, Optional, Dict, Any
 
+from core.config import AppConfig
+from core.storage import ClipboardStorage
 from core.repository import ClipRepository
+from core.app_state import AppState
+from core.retention import enforce_max_items
+from core.clipboard_writer import copy_entry
+from core.backup import export_to_json_str, import_from_json_str
 
 
-class ClipboardMonitor:
+class AppEngine:
     """
-    Polls the clipboard via a reader() function at a fixed interval and ingests
-    new values into the repository. Avoids re-processing the same consecutive value
-    by comparing a normalized key (case-insensitive by default).
+    High-level orchestration:
+    - Manages storage/repository lifecycle
+    - Handles foreground ingestion with last-seen guard
+    - Optional background monitoring
+    - Retention enforcement after ingestion
     """
 
-    def __init__(
-        self,
-        repo: ClipRepository,
-        reader: Callable[[], Optional[str]],
-        interval: float = 1.0,
-        case_insensitive: bool = True,
-    ) -> None:
-        if interval <= 0:
-            interval = 0.1
-        self.repo = repo
-        self.reader = reader
-        self.interval = float(interval)
-        self.case_insensitive = bool(case_insensitive)
-        self._last_seen_key: Optional[str] = None
-        self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
+    def __init__(self, config: AppConfig, clock: Optional[Callable[[], float]] = None) -> None:
+        self.config = config
+        self.storage = ClipboardStorage(config.storage_path)
+        self.repo = ClipRepository(self.storage, clock=clock)
+        self.state = AppState(self.repo, config)
+        self._monitor = None  # type: ignore
 
-    def _key(self, text: str) -> str:
-        return text.casefold() if self.case_insensitive else text
-
-    def run_step(self) -> Optional[dict]:
-        """
-        Perform a single poll step. Returns the added/touched row dict if new content is processed,
-        otherwise None.
-        """
-        try:
-            text = self.reader()
-        except Exception:
-            return None
-        if not isinstance(text, str) or text == "":
-            return None
-        k = self._key(text)
-        if self._last_seen_key is not None and k == self._last_seen_key:
-            return None
-        row = self.repo.add_text(text)
-        self._last_seen_key = k
+    def on_foreground(self, reader: Optional[Callable[[], Optional[str]]] = None) -> Optional[Dict[str, Any]]:
+        row = self.state.on_foreground(reader=reader)
+        if row is not None:
+            try:
+                enforce_max_items(self.storage, self.config.max_items, include_pinned_in_limit=False)
+            except Exception:
+                # retention is best-effort
+                pass
         return row
 
-    def _loop(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                self.run_step()
-            except Exception:
-                # Never break loop on step errors
-                pass
-            # Use wait for better responsiveness to stop
-            self._stop_event.wait(self.interval)
-
-    def start(self) -> bool:
-        if self._thread and self._thread.is_alive():
+    def start_monitor(self, reader: Callable[[], Optional[str]], interval: Optional[float] = None) -> bool:
+        """
+        Start background clipboard monitor. Returns False if already running.
+        """
+        try:
+            from core.monitor import ClipboardMonitor  # local import to avoid cycles
+        except Exception:
             return False
-        self._stop_event.clear()
-        t = threading.Thread(target=self._loop, name="ClipboardMonitor", daemon=True)
-        self._thread = t
-        t.start()
-        return True
+        if self._monitor is not None and getattr(self._monitor, "is_running", lambda: False)():
+            return False
+        mon = ClipboardMonitor(
+            repo=self.repo,
+            reader=reader,
+            interval=float(interval if interval is not None else 1.0),
+            case_insensitive=self.config.dedupe_case_insensitive,
+        )
+        ok = mon.start()
+        self._monitor = mon
+        return ok
 
-    def stop(self, timeout: Optional[float] = 1.0) -> None:
-        self._stop_event.set()
-        t = self._thread
-        if t and t.is_alive():
+    def stop_monitor(self) -> None:
+        mon = self._monitor
+        if mon is not None:
             try:
-                t.join(timeout=timeout)
+                mon.stop()
             except Exception:
                 pass
+        self._monitor = None
 
-    def is_running(self) -> bool:
-        t = self._thread
-        return bool(t and t.is_alive())
+    def is_monitor_running(self) -> bool:
+        mon = self._monitor
+        return bool(mon and mon.is_running())
+
+    # Convenience wrappers
+    def list_all(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        return self.repo.list_all(limit=limit)
+
+    def search(self, query: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        return self.repo.search(query, limit=limit)
+
+    def pin(self, clip_id: int, pinned: bool = True) -> bool:
+        return self.repo.pin(clip_id, pinned)
+
+    def delete(self, clip_id: int) -> bool:
+        return self.repo.delete(clip_id)
+
+    def copy(self, clip_id: int, writer: Optional[Callable[[str], bool]] = None,
+             time_provider: Optional[Callable[[], float]] = None) -> bool:
+        return copy_entry(self.repo, clip_id, set_text=writer, time_provider=time_provider)
+
+    def export_json(self, indent: Optional[int] = 2) -> str:
+        return export_to_json_str(self.storage, indent=indent)
+
+    def import_json(self, content: str) -> int:
+        changed = import_from_json_str(self.storage, content)
+        # enforce retention after import
+        try:
+            enforce_max_items(self.storage, self.config.max_items, include_pinned_in_limit=False)
+        except Exception:
+            pass
+        return changed
+
+    def close(self) -> None:
+        self.stop_monitor()
+        try:
+            self.storage.close()
+        except Exception:
+            pass
